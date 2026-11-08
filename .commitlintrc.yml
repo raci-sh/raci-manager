@@ -1,0 +1,30 @@
+extends:
+  - '@commitlint/config-conventional'
+rules:
+  header-max-length: [2, always, 120]
+
+  # Off. Dependabot copies the casing of the recent commit history when it
+  # writes a subject, and this repo's history includes GitHub's capitalized
+  # "Merge pull request #N" commits, so its PRs arrive as "ci(deps): Bump x"
+  # and failed subject-case ("must not be sentence-case...") on the first one.
+  # Dependabot offers no knob for the casing, so the gate has to move. The
+  # type and scope are still enforced, which is what release-please reads.
+  subject-case: [0]
+
+  # Demoted from error (2) to warning (1). Deliberately demoted rather than
+  # switched off ([0]), so the nudge to wrap prose still surfaces in the husky
+  # commit-msg hook and in CI logs.
+  #
+  # Dependabot composes its own commit bodies, and they carry changelog links
+  # that cannot be wrapped without breaking them — this one is 113 characters:
+  #
+  #   - [Commits](https://github.com/conventional-changelog/commitlint/commits/v21.2.2/@commitlint/config-conventional)
+  #
+  # As an error that failed lint-commits on #46, #48 and #49 within minutes of
+  # dependabot.yml landing. Note what did NOT fail: the subject line, because
+  # dependabot.yml sets commit-message.prefix. The body is the part Dependabot
+  # gives you no knob to shorten, so the gate has to move instead.
+  #
+  # wagoid/commitlint-github-action runs with failOnWarnings: false, so this
+  # keeps those PRs green while still printing the warning.
+  body-max-line-length: [1, always, 100]

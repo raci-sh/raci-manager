@@ -1,0 +1,61 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - misspell
+    - revive
+    - contextcheck
+    - noctx
+    - errorlint
+    - forbidigo
+    - depguard
+  settings:
+    revive:
+      rules:
+        - name: exported
+    # Library packages report through returned errors and verify.Finding
+    # values; they never print, log or exit. The cmd/ entry point and tests
+    # are excluded below.
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: ^fmt\.Print(f|ln)?$
+          msg: library packages return errors or findings, they do not print
+        - pattern: ^print(ln)?$
+          msg: library packages return errors or findings, they do not print
+        - pattern: ^log\..*$
+          msg: library packages must not log; return an error or a finding
+        - pattern: ^os\.Exit$
+          msg: library packages must not exit; return an error
+    # Dependencies point from the consumers (raci-CLI, raci-cloud) to the
+    # manager only, never the other way round. The manager must stay usable
+    # offline, with no cloud dependency.
+    depguard:
+      rules:
+        no-consumer-imports:
+          deny:
+            - pkg: github.com/raci-sh/raci-CLI
+              desc: the manager must not import raci-CLI
+            - pkg: github.com/raci-sh/raci-cloud
+              desc: the manager must not import raci-cloud
+  exclusions:
+    rules:
+      - path: ^src/cmd/
+        linters:
+          - forbidigo
+      - path: _test\.go$
+        linters:
+          - forbidigo
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+run:
+  timeout: 5m

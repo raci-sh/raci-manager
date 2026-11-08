@@ -1,0 +1,39 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint a GitHub App token
+        # raci-sh-app App rather than GITHUB_TOKEN or a PAT: its API commits
+        # are GitHub-signed (enterprise required_signatures, no manual re-sign)
+        # and the events it causes do start workflows, so CI and auto-approve
+        # run on the release PR. promote.yml merges it (merge commit).
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510  # v3.3.0
+        with:
+          app-id: ${{ secrets.RACI_APP_ID }}
+          private-key: ${{ secrets.RACI_APP_PRIVATE_KEY }}
+          # Scoped to this repository (the action's default) and to the two
+          # permissions the step needs: contents (commit) and pull-requests (PR).
+          permission-contents: write
+          permission-pull-requests: write
+
+      # Pinned to a commit SHA: this step holds a write-capable App token.
+      # Update the SHA deliberately.
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
+        with:
+          # Not the default GITHUB_TOKEN: its commits would still be signed, but
+          # no workflow would ever fire from the tags and PRs it creates.
+          token: ${{ steps.app.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          target-branch: main

@@ -1,0 +1,45 @@
+version: 2
+
+builds:
+  - main: ./src/cmd/raci-manager
+    binary: raci-manager
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X github.com/raci-sh/raci-manager/src/internal/version.Version={{.Version}}
+      - -X github.com/raci-sh/raci-manager/src/internal/version.Commit={{.Commit}}
+      - -X github.com/raci-sh/raci-manager/src/internal/version.Date={{.Date}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    # Listing `files` replaces goreleaser's defaults, so the ones worth keeping
+    # are repeated. NOTICE is not a default, and Apache 2.0 section 4(d)
+    # requires redistributions to carry it.
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+      - CHANGELOG.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^ci:"

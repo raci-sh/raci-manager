@@ -1,0 +1,3 @@
+{
+  "Exclude": ["^CLAUDE\\.md$", "^AGENTS\\.md$", "^LICENSE$", "^\\.beads/", "^\\.agents/", "^\\.cursor/", "^\\.codex/", "testdata/.*\\.golden$"]
+}

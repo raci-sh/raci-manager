@@ -1,0 +1,144 @@
+name: Sync release files to develop
+
+# release-please runs on main, so its release commits — the CHANGELOG entry and
+# the version bump in .release-please-manifest.json — land there and nothing
+# carries them back. Left alone, develop drifts one release behind per cut
+# (raci-www sat at 0.2.0 while main reached 0.17.0).
+#
+# That is harmless right up until someone edits any of them on develop. Then the
+# next develop -> main promotion either conflicts, or silently reverts main's
+# version to develop's stale one and release-please cuts the wrong number.
+#
+# Deliberately only these two paths. A full main -> develop merge would also
+# drag back anything else that only lives on main and recreate the drift.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - CHANGELOG.md
+      - .release-please-manifest.json
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Releases can land close together; let one sync finish before the next starts
+# rather than racing two pushes to the same branch.
+concurrency:
+  group: sync-release-files
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Take main's copies of the release files
+        run: git checkout origin/main -- CHANGELOG.md .release-please-manifest.json
+
+      - name: Mint a GitHub App token
+        # raci-sh-app App rather than GITHUB_TOKEN: GitHub never starts workflows for
+        # events caused by GITHUB_TOKEN, so the PR this job opens had no CI and no
+        # auto-approve and always needed a human merge. App-token commits made through
+        # the API stay GitHub-signed, which develop's signature rule requires.
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510  # v3.3.0
+        with:
+          app-id: ${{ secrets.RACI_APP_ID }}
+          private-key: ${{ secrets.RACI_APP_PRIVATE_KEY }}
+          # Scoped to this repository (the action's default) and to the two
+          # permissions the step needs: contents (commit) and pull-requests (PR).
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open or update the sync PR
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          # Kept out of the script so no heredoc has to survive YAML indentation.
+          PR_BODY: |
+            Carries `CHANGELOG.md` and `.release-please-manifest.json` back from `main`.
+
+            release-please commits these on `main`, and nothing else brings them to
+            `develop` — so without this they drift apart until an edit to either file
+            on `develop` makes the next promotion conflict, or silently reverts main's
+            version.
+
+            Only those two paths are synced.
+
+            Opened by `.github/workflows/sync-release-files.yml` as the raci-sh-app App,
+            so CI and auto-approve run on it like on any other PR.
+        run: |
+          set -euo pipefail
+
+          # A develop -> main promotion pushes to main without changing these
+          # files, so it should not trigger this workflow at all — but if it
+          # ever does, exit quietly rather than opening an empty PR.
+          if git diff --cached --quiet; then
+            echo "develop already matches main; nothing to sync"
+            exit 0
+          fi
+
+          BRANCH=chore/sync-release-files
+          TMP_BRANCH=chore/sync-release-files-tmp
+          BASE_SHA=$(git rev-parse HEAD)
+
+          # develop requires signed commits, and a plain `git commit` here is
+          # unsigned. A commit made through the GraphQL API is signed by GitHub,
+          # but that mutation only adds to an existing branch.
+          #
+          # Build it on a temporary branch rooted at develop and only then point
+          # the sync branch at the finished commit. Resetting the sync branch to
+          # develop first would leave an open PR with head == base for a moment,
+          # and GitHub marks such a PR merged for good.
+          #
+          # Forcing the sync branch is safe and intended: it is bot-owned and
+          # always represents "whatever main currently has", never accumulated work.
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$TMP_BRANCH" >/dev/null 2>&1 || true
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/heads/$TMP_BRANCH" -f sha="$BASE_SHA" >/dev/null
+
+          SIGNED_SHA=$(jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg branch "$TMP_BRANCH" \
+            --arg oid "$BASE_SHA" \
+            --arg changelog "$(base64 -w0 < CHANGELOG.md)" \
+            --arg manifest "$(base64 -w0 < .release-please-manifest.json)" \
+            '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              variables: { input: {
+                branch: { repositoryNameWithOwner: $repo, branchName: $branch },
+                message: { headline: "chore: sync release files from main" },
+                expectedHeadOid: $oid,
+                fileChanges: { additions: [
+                  { path: "CHANGELOG.md", contents: $changelog },
+                  { path: ".release-please-manifest.json", contents: $manifest }
+                ] }
+              } }
+            }' | gh api graphql --input - --jq '.data.createCommitOnBranch.commit.oid')
+
+          # Singular /git/ref/ matches exactly; the plural GET prefix-matches, so it
+          # would find the tmp branch (same prefix) when the sync branch is absent.
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH" \
+              -f sha="$SIGNED_SHA" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/heads/$BRANCH" -f sha="$SIGNED_SHA" >/dev/null
+          fi
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$TMP_BRANCH" >/dev/null
+
+          if [ -n "$(gh pr list --head "$BRANCH" --base develop --state open --json number --jq '.[].number')" ]; then
+            echo "sync PR already open; the force-push updated it"
+            exit 0
+          fi
+
+          gh pr create \
+            --base develop \
+            --head "$BRANCH" \
+            --title "chore: sync release files from main" \
+            --body "$PR_BODY"

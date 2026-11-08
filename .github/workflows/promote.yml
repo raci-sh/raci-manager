@@ -1,0 +1,251 @@
+name: Promote to production
+
+# One click replaces the three manual merges a release took:
+#   1. develop -> main promotion PR
+#   2. release-please's release PR (tags the release, bumps CHANGELOG.md)
+#   3. the sync-release-files PR that carries CHANGELOG.md and the manifest back
+#      to develop
+#
+# Run it from the Actions tab, or `gh workflow run promote.yml --ref main`.
+# Dispatch from main, not develop: a run's job is a check on the ref's head
+# commit, and on develop that is the promotion PR's own head, so the approval
+# bot sees a pending/failing check and never approves the PR this job waits on. Nothing ships
+# unless someone starts it. Each step stops with a clear error rather than
+# guessing, so a half-finished run is safe to re-run: every step first looks for
+# work a previous run already did.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+env:
+  # No checkout, so gh cannot infer the repository from a working tree.
+  GH_REPO: ${{ github.repository }}
+
+# Two promotions racing would open duplicate PRs and merge each other's.
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    # Worst case, every stage uses its full budget: promotion merge 15, release-please
+    # 5, release merge 15, sync PR to appear 5, sync merge 20 = 60 minutes.
+    timeout-minutes: 75
+    steps:
+      - name: Mint a GitHub App token
+        # raci-sh-app App, as in release-please.yml: its API merges are
+        # GitHub-signed (main requires signatures) and the pushes it causes do
+        # start workflows, which release-please needs to see the promotion.
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510  # v3.3.0
+        with:
+          app-id: ${{ secrets.RACI_APP_ID }}
+          private-key: ${{ secrets.RACI_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+
+      - name: Open the promotion PR
+        id: promote
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          # Captured once, here: this is the develop commit the compare below and
+          # the PR body describe. The merge is pinned to it, so anything pushed
+          # to develop after this point fails the merge instead of shipping.
+          DEV_SHA=$(gh api "repos/$GITHUB_REPOSITORY/branches/develop" --jq .commit.sha)
+
+          # develop is the only side that can be ahead: main gets its own
+          # commits (release-please) but each one is merged back or
+          # deliberately kept out, so only develop's extra commits matter.
+          AHEAD=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...develop" --jq .ahead_by)
+
+          # --head matches branch names across forks, so a fork's `develop` would
+          # match too. Same-repo PRs only.
+          PR=$(gh pr list --head develop --base main --state open \
+            --json number,isCrossRepository \
+            --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')
+          if [ -z "$PR" ]; then
+            if [ "$AHEAD" -eq 0 ]; then
+              # Not a stop: a previous run may have merged this and died later,
+              # so the release and sync-back steps still look for open work.
+              echo "develop has nothing main lacks; skipping the promotion itself"
+              exit 0
+            fi
+            # Merge commits only: main's history keeps develop's PR boundaries.
+            SUBJECTS=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...develop" \
+              --jq '[.commits[] | select((.parents|length) == 1) | "- " + (.commit.message | split("\n")[0])] | join("\n")')
+            # The backticks are Markdown for the PR body, not command substitution.
+            # shellcheck disable=SC2016
+            PR=$(gh pr create --base main --head develop \
+              --title "chore: promote develop to main" \
+              --body "$(printf 'Promotes %s commit(s) from `develop`.\n\n%s\n\nOpened and merged by `.github/workflows/promote.yml`, which merges with a **merge commit**.' "$AHEAD" "$SUBJECTS")" \
+              | grep -oE '[0-9]+$')
+          fi
+          # A reused PR may predate later pushes to develop; refuse rather than
+          # merge commits nobody looked at.
+          PR_HEAD=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+          if [ "$PR_HEAD" != "$DEV_SHA" ]; then
+            echo "::error::PR #$PR head $PR_HEAD != develop $DEV_SHA; re-run to retry"
+            exit 1
+          fi
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+          echo "dev_sha=$DEV_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Merge the promotion PR
+        if: steps.promote.outputs.pr != ''
+        id: merge
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PR: ${{ steps.promote.outputs.pr }}
+          DEV_SHA: ${{ steps.promote.outputs.dev_sha }}
+        run: |
+          set -euo pipefail
+          # main requires an approving review, which the auto-approve bot posts a
+          # few minutes after the PR opens: retry rather than fail on the first
+          # refusal. The pin means a head change fails every attempt, not just one.
+          for _ in $(seq 1 45); do
+            ERR=$(gh pr merge "$PR" --merge --match-head-commit "$DEV_SHA" 2>&1) || true
+            # Exit 0 can mean "auto-merge enabled", not merged: trust the state.
+            [ "$(gh pr view "$PR" --json state --jq .state)" = MERGED ] && break
+            sleep 20
+          done
+          [ "$(gh pr view "$PR" --json state --jq .state)" = MERGED ] || {
+            echo "::error::PR #$PR was not merged within 15 minutes. Last refusal: $(printf %s "${ERR:-none}" | tr '\n' ' ')"; exit 1; }
+          # If auto-merge were ever enabled, a later push could have merged instead
+          # of the pinned head; make that a hard failure, not a silent success.
+          [ "$(gh pr view "$PR" --json headRefOid --jq .headRefOid)" = "$DEV_SHA" ] || {
+            echo "::error::PR #$PR merged a head other than the pinned $DEV_SHA"; exit 1; }
+          SHA=$(gh pr view "$PR" --json mergeCommit --jq .mergeCommit.oid)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Merge release-please's release PR
+        id: release
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          MERGED_SHA: ${{ steps.merge.outputs.sha }}
+          # The App is not granted `actions: read`; the run's own token is, via the
+          # permissions block above. Used only for `gh run list/watch` below.
+          RUN_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # release-please runs on every push to main. Wait for the run on the
+          # commit that matters: the promotion merge when this run made one,
+          # otherwise main's current tip (a re-run after an earlier run died, or
+          # while release-please is still going). Without that wait, an absent
+          # release PR would be misread as "nothing releasable".
+          SHA=$MERGED_SHA
+          TRIES=30
+          if [ -z "$SHA" ]; then
+            SHA=$(gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)
+            TRIES=6   # the tip's run may predate retention; do not wait long for it
+          fi
+          RUN=""
+          for _ in $(seq 1 "$TRIES"); do
+            RUN=$(GH_TOKEN="$RUN_TOKEN" gh run list --workflow release-please.yml --commit "$SHA" \
+              --json databaseId --jq '.[0].databaseId // empty')
+            [ -n "$RUN" ] && break
+            sleep 10
+          done
+          if [ -n "$RUN" ]; then
+            GH_TOKEN="$RUN_TOKEN" gh run watch "$RUN" --exit-status
+          elif [ -n "$MERGED_SHA" ]; then
+            echo "::error::release-please never started for $SHA"
+            exit 1
+          fi
+
+          # Same-repo and bot-authored only: --head alone also matches fork PRs.
+          # `gh pr list` is expected to report the App as "app/raci-sh-app" and the
+          # REST API as "raci-sh-app[bot]" (the form seen for the steerspec-sync
+          # App in strspc-www; not yet confirmed for this App). Accept
+          # both so a change in either does not silently skip the release.
+          REL=$(gh pr list --head release-please--branches--main --base main --state open \
+            --json number,isCrossRepository,author,headRefOid \
+            --jq '[.[] | select(.isCrossRepository == false and (.author.login | IN("app/raci-sh-app", "raci-sh-app[bot]")))][0] // empty')
+          if [ -z "$REL" ]; then
+            # Only hidden commit types (chore) since the last release.
+            echo "No open release PR: nothing releasable; no version cut."
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          REL_N=$(jq -r .number <<<"$REL"); REL_SHA=$(jq -r .headRefOid <<<"$REL")
+          # Same wait as the promotion PR: the release PR also needs an approval.
+          for _ in $(seq 1 45); do
+            ERR=$(gh pr merge "$REL_N" --merge --match-head-commit "$REL_SHA" 2>&1) || true
+            [ "$(gh pr view "$REL_N" --json state --jq .state)" = MERGED ] && break
+            sleep 20
+          done
+          [ "$(gh pr view "$REL_N" --json state --jq .state)" = MERGED ] || {
+            echo "::error::Release PR #$REL_N was not merged within 15 minutes. Last refusal: $(printf %s "${ERR:-none}" | tr '\n' ' ')"; exit 1; }
+          [ "$(gh pr view "$REL_N" --json headRefOid --jq .headRefOid)" = "$REL_SHA" ] || {
+            echo "::error::Release PR #$REL_N merged a head other than the pinned $REL_SHA"; exit 1; }
+          echo "released=true" >> "$GITHUB_OUTPUT"
+
+      - name: Merge the sync-back PR into develop
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RELEASED: ${{ steps.release.outputs.released }}
+        run: |
+          set -euo pipefail
+
+          # sync-release-files.yml force-pushes chore/sync-release-files after a
+          # release lands, so an old PR can sit there with an old head until the
+          # run for this release updates it. A PR counts as current only when its
+          # copies of the two release files are byte-identical to main's.
+          blob() { gh api "repos/$GITHUB_REPOSITORY/contents/$1?ref=$2" --jq .sha; }
+          current() { # $1 = PR head sha
+            [ "$(blob CHANGELOG.md "$1")" = "$(blob CHANGELOG.md main)" ] &&
+            [ "$(blob .release-please-manifest.json "$1")" = "$(blob .release-please-manifest.json main)" ]
+          }
+
+          # The PR needs CI and the auto-approve bot, so poll rather than merge blind.
+          SYNC=""
+          for _ in $(seq 1 30); do
+            PR=$(gh pr list --head chore/sync-release-files --base develop --state open \
+              --json number,headRefOid,isCrossRepository,author \
+              --jq '[.[] | select(.isCrossRepository == false and (.author.login | IN("app/raci-sh-app", "raci-sh-app[bot]")))][0] // empty')
+            if [ -n "$PR" ] && current "$(jq -r .headRefOid <<<"$PR")"; then
+              SYNC=$(jq -r .number <<<"$PR")
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$SYNC" ]; then
+            if [ "$RELEASED" = "true" ]; then
+              echo "::error::A release was cut but no up-to-date sync PR appeared; check sync-release-files.yml"
+              exit 1
+            fi
+            echo "No release this run and no stale sync PR; nothing to carry back."
+            exit 0
+          fi
+
+          # Re-read the head every attempt and pin the merge to it: the branch is
+          # force-pushed by bot, so a head change must fail the attempt, not slip in.
+          for _ in $(seq 1 60); do
+            HEAD_SHA=$(gh pr view "$SYNC" --json headRefOid --jq .headRefOid)
+            if current "$HEAD_SHA"; then
+              # Squash: the merge-method-develop ruleset refuses anything else.
+              ERR=$(gh pr merge "$SYNC" --squash --match-head-commit "$HEAD_SHA" 2>&1) || true
+            else
+              # Replaces any earlier refusal, which was for a head that is gone.
+              ERR="head $HEAD_SHA does not carry main's release files (sync branch rewritten or stale)"
+            fi
+            if [ "$(gh pr view "$SYNC" --json state --jq .state)" = MERGED ]; then
+              MERGED_HEAD=$(gh pr view "$SYNC" --json headRefOid --jq .headRefOid)
+              current "$MERGED_HEAD" || { echo "::error::Sync PR #$SYNC merged a head that does not match main's release files"; exit 1; }
+              echo "Merged sync PR #$SYNC"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::Sync PR #$SYNC is still not mergeable (CI or approval pending). Last refusal: $(printf %s "${ERR:-none}" | tr '\n' ' '). Merge it by hand, or re-run."
+          exit 1

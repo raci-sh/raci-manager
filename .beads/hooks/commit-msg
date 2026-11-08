@@ -1,0 +1,22 @@
+#!/bin/sh
+# commit-msg: check that the message is a Conventional Commit.
+# Not managed by beads: bd installs the other hooks in this directory and
+# leaves this one alone. core.hooksPath points here after `bd init` or
+# `bd hooks install`. CI (lint-commits in ci.yml, pr-title.yml) is the gate
+# that always runs; this only catches mistakes before they are pushed.
+
+commit_msg=$(head -1 "$1")
+
+case "$commit_msg" in
+  Merge\ *|Revert\ *|fixup!\ *|squash!\ *) exit 0 ;;
+esac
+
+pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .+'
+
+if ! printf '%s\n' "$commit_msg" | grep -Eq "$pattern"; then
+  echo "ERROR: commit message does not follow Conventional Commits." >&2
+  echo "  Expected: <type>(<scope>): <description>" >&2
+  echo "  Types:    feat fix docs style refactor perf test build ci chore revert" >&2
+  echo "  Got:      $commit_msg" >&2
+  exit 1
+fi
