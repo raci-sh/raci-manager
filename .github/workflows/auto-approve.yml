@@ -172,7 +172,7 @@ jobs:
       # Pinned to a commit SHA because this job runs with a write-capable bot
       # token under pull_request_target. A moving tag could run different code
       # with that token; update the SHA deliberately.
-      - uses: SteerSpec/strspc-pr-review@e52a7dd3349a2d1397e2415e2ece32a9767f12a3  # v1.10.3
+      - uses: SteerSpec/strspc-pr-review@43b6dfd8c03d12d540bc0457a7c90cda4404fdb3  # v1.11.1
         with:
           # Required: GitHub login of the bot account that will approve PRs.
           # Keep this expression identical to the loop guard in the if: above.
