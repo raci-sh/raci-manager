@@ -37,8 +37,11 @@ A realm keeps two files side by side, both committed to the repository:
 
 | File | Package | What it is |
 | ---- | ------- | ---------- |
-| `.raci.jsonl` | `eventlog` | The append-only audit log: one canonical JSON event per line, hash-chained through `prev_hash` (§4.2) |
+| `.raci.jsonl`¹ | `eventlog` | The append-only audit log: one canonical JSON event per line, hash-chained through `prev_hash` (§4.2) |
 | `.raci` | `view` | The materialised view: the realm's RACI as of the log head, rebuilt and checked by replay (§7) |
+
+¹ A proposal, not yet a fixed name: the specification leaves the log file name open. Code should
+use `eventlog.FileName` rather than the literal.
 
 ## Packages
 
