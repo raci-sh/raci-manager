@@ -7,7 +7,7 @@ toolchain go1.26.1
 require (
 	github.com/gowebpki/jcs v1.0.2
 	github.com/spf13/cobra v1.10.2
-	lukechampine.com/blake3 v1.4.1
+	lukechampine.com/blake3 v1.5.0
 )
 
 require (
